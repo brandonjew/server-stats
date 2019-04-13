@@ -1,0 +1,208 @@
+#!/u/local/apps/python/3.6.1/bin/python3
+
+"""Check resource requests and usage from a given month"""
+
+import argparse
+import os
+import re
+import sys
+import datetime
+import numpy as np
+
+# Accounting file format
+_user_col = 3
+_job_name_col = 4
+_exit_status_col = 12
+_accounting_delimiter = ":"
+
+# Data that will be pulled for relevant jobs
+# You can add to this. Be sure to update _stat_cols and _stat_parsers
+# if necessary
+
+_stat_types = {
+              "requested_mem":   np.float32,
+              "requested_rt":    np.float32,
+              "actual_mem":      np.float32,
+              "actual_rt":       np.float32,
+#              "io":              np.float32,
+#              "submission_time": np.int32,
+#              "start_time":      np.int32,
+              }
+
+# Column numbers (0-indexed) for accounting file
+# Check "man accounting" for available fields
+
+_stat_cols = {
+             "requested_mem":   39,
+             "requested_rt":    39,
+             "actual_mem":      42,
+             "actual_rt":       13,
+#             "io":              38,
+#             "submission_time": 8,
+#             "start_time":      9,
+             }
+
+# Function to extract statistic from column if needed
+
+def parse_mem(resource_str):
+  """ Return memory given resource request string"""
+  default_mem = 1
+  mem_regex = "h_data=[0-9]{1,20}[a-z,A-Z]"
+  mem = default_mem
+  mem_str = re.search(mem_regex, resource_str)
+  if mem_str:
+    mem_str = mem_str.group().split("=")[1].lower()
+    if mem_str[-1] == "g": # Gigabyte
+      mem = np.float32(mem_str.strip("g"))
+    elif mem_str[-1] == "m": # Megabyte
+      mem = np.float32(mem_str.strip("m"))/1000
+  return mem
+
+def parse_rt(resource_str):
+  """Return runtime given resource request string in hours"""
+  default_rt = 7200
+  rt_regex = "h_rt=[0-9]{1,20}"
+  rt = default_rt
+  rt_str = re.search(rt_regex, resource_str)
+  if rt_str:
+    rt = np.float32(rt_str.group().split("=")[1])
+  rt = rt/3600
+  return rt
+
+# If parser not specified, will simply cast entire column to _stat_type
+# Parser functions must be defined above this dict instantiation. 
+
+_stat_parsers = {
+                  "requested_mem":   parse_mem,
+                  "requested_rt":    parse_rt,
+                  "actual_mem":      lambda x: np.float32(x)/1e9 ,
+                  "actual_rt":       lambda x: np.float32(x)/3600 ,
+                }
+
+
+def find_accounting_file(date):
+  """Get path to accounting file for given month. If none given, retrieve
+     most recent month
+
+  Args:
+    date: String in format "YYYY-MM"
+  Returns:
+    A string. Path to accounting file
+  """
+  if not date:
+    year = str(datetime.datetime.now().year)
+    month = str(datetime.datetime.now().month-1).zfill(2)
+    date = f"{year}-{month}"
+  sge_root = os.environ["SGE_ROOT"]
+  sge_cell = os.environ["SGE_CELL"]
+  accounting_path = f"{sge_root}/{sge_cell}/common/accounting-{date}"
+  if not os.path.isfile(accounting_path):
+    raise Exception(f"Could not locate accounting file at: {accounting_path}")
+  return(accounting_path)
+
+
+def parse_accounting_file(accounting_path, user, pattern, exit_status):
+  """Return statistics on jobs run by user
+
+  Args:
+    accounting_path: String. Produced by find_accounting_file()
+    user: String. Will find jobs owned by given user
+    pattern: String. Regex that will be used to filter by job name
+  Returns:
+    job_stats: Dictionary with relevant info
+  """
+  job_stats = {}
+  for stat in _stat_types:
+    job_stats[stat] = []
+  with open(accounting_path, "r") as accounting_file:
+    for line in accounting_file:
+      entries = line.strip().split(_accounting_delimiter)
+      curr_user = entries[_user_col]
+      if curr_user != user:
+        continue
+      job_name = entries[_job_name_col]
+      if pattern and not re.search(pattern, job_name):
+        continue
+      curr_exit_status = np.int32(entries[_exit_status_col])
+      if exit_status != -1 and curr_exit_status != exit_status:
+        continue
+      for stat in job_stats:
+        val = entries[_stat_cols[stat]]
+        if stat in _stat_parsers:
+          val = _stat_parsers[stat](val)
+        val = _stat_types[stat](val)
+        job_stats[stat].append(val)
+  for stat in job_stats:
+    job_stats[stat] = np.array(job_stats[stat], dtype=_stat_types[stat])
+  return job_stats
+
+def summarize(job_stats):
+  """Summarize results.
+
+    Note that this function is written specifically for the default _stat_types
+    defined at the top of this file.
+  """
+  n_jobs = job_stats["requested_mem"].shape[0]
+  print(f"Found {n_jobs} matching jobs.")
+  avg_mem_request = job_stats["requested_mem"].mean()
+  avg_mem_usage = job_stats["actual_mem"].mean()
+  avg_mem_diff = (job_stats["requested_mem"] - job_stats["actual_mem"]).mean()
+  avg_mem_ratio = job_stats["actual_mem"]/job_stats["requested_mem"]
+  avg_mem_ratio = avg_mem_ratio[np.isfinite(avg_mem_ratio)].mean()
+  max_mem_usage = job_stats["actual_mem"].max()
+  print("On average, these jobs:")
+  print(f"\t-request {avg_mem_request:0.2f} GB of memory.")
+  print(f"\t-will have a peak usage of {avg_mem_usage:0.2f} GB of memory")
+  print(f"\t-leave {avg_mem_diff:0.2f} GB unused")
+  print(f"\t-use {avg_mem_ratio*100:0.2f}% of requested memory")
+  print("The highest observed memory usage among these jobs was "
+      f"{max_mem_usage:0.2f} GB.")
+
+
+
+def main(user, pattern, date, accounting_path, exit_status):
+  if not accounting_path:
+    accounting_path = find_accounting_file(date)
+  print(f"Parsing accounting file ({accounting_path})\n"
+        f"for jobs belonging to {user}")
+  if pattern:
+    print(f"Filtering for jobs with name containing pattern: {pattern}")
+  if exit_status != -1:
+    print(f"Filtering for jobs with exit status {exit_status}")
+  job_stats = parse_accounting_file(accounting_path, user, pattern, exit_status)
+  summarize(job_stats)
+
+if __name__ == "__main__":
+  parser = argparse.ArgumentParser(description="Check resourse requests and "
+                                               "usage in a given month")
+  parser.add_argument('-u', help="Specify user. Default is current user.",
+                      type=str,
+                      default=os.environ["USER"],
+                      metavar="USER")
+  parser.add_argument('-p', help="Regex pattern to filter for specific job "
+                                 "names. Default will summarize all jobs.",
+                      type=str,
+                      default="",
+                      metavar="PATTERN")
+  parser.add_argument('-d', help="Specify month to check. Default will"
+                                 " check last month's usage.",
+                      type=str,
+                      default="",
+                      metavar="YYYY-MM")
+  parser.add_argument('-f', help="Specify accounting file path. Default will "
+                                 "look in <SGE_ROOT>/<SGE_CELL>/common",
+                      type=str,
+                      default="",
+                      metavar="FILE")
+  parser.add_argument('-e', help="Specify exit status to filter for jobs. "
+                                 "Default will include all jobs, regardless "
+                                 " of exit status",
+                      type=np.int32,
+                      default=-1)
+  args = parser.parse_args()
+  user = args.u
+  pattern = args.p
+  date = args.d
+  accounting_path = args.f
+  exit_status = args.e
+  main(user, pattern, date, accounting_path, exit_status)
